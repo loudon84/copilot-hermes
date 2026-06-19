@@ -751,6 +751,53 @@ def clean_base64_images(text: str) -> str:
 # Both plugins register through agent.web_search_registry and the
 # dispatchers in this file resolve them via get_active_*_provider().
 
+def _register_bundled_web_provider_fallback() -> None:
+    """Fallback-register bundled web providers when plugin discovery does not populate the registry.
+
+    Hermes v0.16.0 can successfully run plugin discovery while leaving
+    agent.web_search_registry empty in some containerized deployments.
+    web_search/web_extract then return "No provider configured" even though
+    bundled plugins and provider modules exist. This fallback calls bundled
+    web plugin register(ctx) functions directly when the registry is empty.
+    """
+    try:
+        import importlib
+        from agent.web_search_registry import list_providers, register_provider
+
+        if list_providers():
+            return
+
+        class _WebProviderContext:
+            def register_web_search_provider(self, provider):
+                register_provider(provider)
+
+        for _mod_name in (
+            "plugins.web.ddgs",
+            "plugins.web.firecrawl",
+            "plugins.web.tavily",
+            "plugins.web.exa",
+            "plugins.web.parallel",
+            "plugins.web.searxng",
+            "plugins.web.brave_free",
+            "plugins.web.xai",
+        ):
+            try:
+                _mod = importlib.import_module(_mod_name)
+                _register = getattr(_mod, "register", None)
+                if callable(_register):
+                    _register(_WebProviderContext())
+            except Exception as _exc:
+                logger.debug(
+                    "Bundled web plugin register failed: %s: %s",
+                    _mod_name,
+                    _exc,
+                )
+    except Exception as exc:
+        logger.warning(
+            "Bundled web provider fallback registration failed: %s",
+            exc,
+        )
+
 
 def _ensure_web_plugins_loaded() -> None:
     """Idempotently trigger plugin discovery so the web registry is populated.
@@ -780,6 +827,7 @@ def _ensure_web_plugins_loaded() -> None:
         # clue in normal logs about the real cause.
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
 
+    _register_bundled_web_provider_fallback()
 
 def web_search_tool(query: str, limit: int = 5) -> str:
     """

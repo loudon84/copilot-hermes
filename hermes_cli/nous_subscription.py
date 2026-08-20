@@ -182,7 +182,9 @@ def _has_agent_browser() -> bool:
     # POSIX shim directly fails exec (WinError 193) even right after a
     # successful ``npm install`` — the bug that pinned every browser row on
     # "Setup required" in the desktop GUI.
-    local_bin_dir = Path(__file__).parent.parent / "node_modules" / ".bin"
+    from hermes_constants import get_node_workspace_root
+
+    local_bin_dir = get_node_workspace_root() / "node_modules" / ".bin"
     if local_bin_dir.is_dir():
         local_which = shutil.which("agent-browser", path=str(local_bin_dir))
         if local_which and agent_browser_runnable(local_which):

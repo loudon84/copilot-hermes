@@ -841,9 +841,22 @@ from hermes_constants import is_termux as _is_termux_environment
 
 
 def _browser_install_hint() -> str:
+    from hermes_constants import get_node_workspace_root, is_managed_install
+
+    if is_managed_install():
+        workspace = get_node_workspace_root()
+        return (
+            f"Hermes Node runtime is managed by SMC. "
+            f"Node workspace: {workspace}. "
+            "Run SMC Hermes repair through OPSI."
+        )
     if _is_termux_environment():
         return "npm install -g agent-browser && agent-browser install"
-    return "npm install -g agent-browser && agent-browser install --with-deps"
+    workspace = get_node_workspace_root()
+    return (
+        f"cd {workspace} && npm install --workspaces=false && "
+        "npx agent-browser install --with-deps"
+    )
 
 
 def _requires_real_termux_browser_install(browser_cmd: str) -> bool:
@@ -2353,7 +2366,7 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             _agent_browser_resolved = True
             return which_result
 
-    # Check local node_modules/.bin/ (npm install in repo root).
+    # Check local node_modules/.bin/ (npm install in Node workspace).
     # On Windows, npm drops three shims in .bin: an extensionless POSIX shell
     # script (for Git Bash / WSL), `agent-browser.cmd` (for cmd/PowerShell),
     # and `agent-browser.ps1` (for PowerShell). CreateProcess (used by Python's
@@ -2361,8 +2374,9 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     # WinError 193 "%1 is not a valid Win32 application". We must resolve to the
     # `.cmd` shim instead. `shutil.which` consults PATHEXT, so we delegate to it
     # with an explicit path so POSIX hosts still pick the extensionless shim.
-    repo_root = Path(__file__).parent.parent
-    local_bin_dir = repo_root / "node_modules" / ".bin"
+    from hermes_constants import get_managed_node_root, get_node_workspace_root
+
+    local_bin_dir = get_node_workspace_root() / "node_modules" / ".bin"
     if local_bin_dir.is_dir():
         local_which = shutil.which("agent-browser", path=str(local_bin_dir))
         if local_which and (
@@ -2391,13 +2405,19 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     # Nothing found — try lazy installation before giving up.
     try:
         from hermes_cli.dep_ensure import ensure_dependency
-        if ensure_dependency("browser"):
+        from hermes_constants import is_managed_install
+
+        if not is_managed_install() and ensure_dependency("browser"):
+            node_root = get_managed_node_root()
             candidates = [
                 shutil.which("agent-browser"),
                 shutil.which("agent-browser", path=extended_path) if extended_path else None,
-                shutil.which("agent-browser", path=str(get_hermes_home() / "node_modules" / ".bin")),
-                shutil.which("agent-browser", path=str(get_hermes_home() / "node" / "bin")),
-                shutil.which("agent-browser", path=str(get_hermes_home() / "node")),
+                shutil.which(
+                    "agent-browser",
+                    path=str(get_node_workspace_root() / "node_modules" / ".bin"),
+                ),
+                shutil.which("agent-browser", path=str(node_root / "bin")),
+                shutil.which("agent-browser", path=str(node_root)),
             ]
             for recheck in candidates:
                 if recheck and agent_browser_runnable(recheck):

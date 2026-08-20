@@ -383,6 +383,19 @@ def _stable_gateway_working_dir(project_root: Path) -> str:
 # Script rendering
 # ---------------------------------------------------------------------------
 
+def _append_managed_runtime_env_to_cmd(lines: list[str]) -> None:
+    from hermes_constants import managed_runtime_env_overrides
+
+    for key, value in managed_runtime_env_overrides().items():
+        lines.append(f'set "{key}={value}"')
+
+
+def _append_managed_runtime_env_to_overlay(env_overlay: dict[str, str]) -> None:
+    from hermes_constants import managed_runtime_env_overrides
+
+    env_overlay.update(managed_runtime_env_overrides())
+
+
 def _build_gateway_cmd_script(
     python_path: str,
     working_dir: str,
@@ -409,6 +422,7 @@ def _build_gateway_cmd_script(
     lines = ["@echo off", f"rem {_TASK_DESCRIPTION}"]
     lines.append(f"cd /d {_quote_cmd_script_arg(working_dir)}")
     lines.append(f'set "HERMES_HOME={hermes_home}"')
+    _append_managed_runtime_env_to_cmd(lines)
     lines.append('set "PYTHONIOENCODING=utf-8"')
     lines.append('set "HERMES_GATEWAY_DETACHED=1"')
     python_exe_path, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
@@ -494,6 +508,14 @@ def _build_gateway_vbs_script(
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({_quote_vbs_string('HERMES_HOME')}) = {_quote_vbs_string(hermes_home)}",
+    ]
+    from hermes_constants import managed_runtime_env_overrides
+
+    for key, value in managed_runtime_env_overrides().items():
+        lines.append(
+            f"env.Item({_quote_vbs_string(key)}) = {_quote_vbs_string(value)}"
+        )
+    lines.extend([
         f"env.Item({_quote_vbs_string('PYTHONIOENCODING')}) = {_quote_vbs_string('utf-8')}",
         f"env.Item({_quote_vbs_string('HERMES_GATEWAY_DETACHED')}) = {_quote_vbs_string('1')}",
         f"env.Item({_quote_vbs_string('VIRTUAL_ENV')}) = {_quote_vbs_string(_preserve_hermes_home_path(venv_dir))}",
@@ -510,7 +532,7 @@ def _build_gateway_vbs_script(
         # console python's one console is created hidden and inherited by all
         # descendants, so nothing ever flashes.
         f"sh.Run {_quote_vbs_string(command_line)}, 0, False",
-    ]
+    ])
     return "\r\n".join(lines) + "\r\n"
 
 
@@ -818,6 +840,7 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
         if extra_pythonpath
         else [project_root],
     )
+    _append_managed_runtime_env_to_overlay(env_overlay)
     return argv, working_dir, env_overlay
 
 
@@ -885,6 +908,7 @@ def windowless_gateway_restart_spec(
         env_overlay,
         [project_root, *extra_pythonpath] if extra_pythonpath else [project_root],
     )
+    _append_managed_runtime_env_to_overlay(env_overlay)
     return new_argv, working_dir, env_overlay
 
 

@@ -579,6 +579,22 @@ def run_uninstall(args):
     project_root = get_project_root()
     hermes_home = get_hermes_home()
 
+    from hermes_constants import get_program_root, is_managed_install
+
+    if is_managed_install():
+        program_root = get_program_root()
+        print(
+            color(
+                "Hermes runtime is managed by SMC. "
+                "Uninstall the agent through OPSI/MSI — not hermes uninstall.",
+                Colors.YELLOW,
+            )
+        )
+        if program_root:
+            print(f"  Program root: {program_root}")
+        print(f"  Data root:    {hermes_home}")
+        sys.exit(1)
+
     if bool(getattr(args, "dry_run", False)):
         _print_uninstall_dry_run(
             project_root=project_root,

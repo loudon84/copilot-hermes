@@ -36,7 +36,8 @@ from pathlib import Path
 
 from hermes_constants import (
     bootstrap_hermes_managed_node,
-    get_hermes_home,
+    get_managed_node_root,
+    is_managed_install,
     with_hermes_node_path,
 )
 
@@ -143,7 +144,7 @@ def managed_npm_prefix(npm: str | os.PathLike[str] | None) -> Path | None:
     """
     if not npm:
         return None
-    prefix = get_hermes_home() / "node"
+    prefix = get_managed_node_root()
     try:
         resolved = Path(npm).resolve()
         prefix_resolved = prefix.resolve()
@@ -179,6 +180,14 @@ def upgrade_managed_npm(
     installs land on PATH, and without the override the "upgrade" would install
     a second npm somewhere else while the managed one stayed stale.
     """
+    if is_managed_install():
+        if not quiet:
+            print(
+                "✗ Hermes runtime is managed by SMC — npm upgrades are "
+                "handled by OPSI repair.",
+                flush=True,
+            )
+        return False
     if not quiet:
         print(
             f"→ Upgrading Hermes-managed npm to satisfy {npm_range}…",

@@ -76,8 +76,20 @@ function appendUniquePathEntries(entries, { delimiter = path.delimiter } = {}) {
  */
 function hermesManagedNodePathEntries(
   hermesHome,
-  { platform = process.platform, pathModule = pathModuleForPlatform(platform) }: any = {}
+  {
+    platform = process.platform,
+    pathModule = pathModuleForPlatform(platform),
+    agentRoot = process.env.HERMES_AGENT_ROOT
+  }: any = {}
 ) {
+  const configuredAgentRoot = String(agentRoot || '').trim()
+  if (configuredAgentRoot) {
+    const root = pathModule.dirname(pathModule.resolve(configuredAgentRoot))
+    const bin = pathModule.join(root, 'bin')
+
+    return platform === 'win32' ? [root, bin] : [bin, root]
+  }
+
   if (!hermesHome) {
     return []
   }

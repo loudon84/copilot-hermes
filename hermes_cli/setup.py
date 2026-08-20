@@ -3126,10 +3126,20 @@ def run_setup_wizard(args):
 
     # ── Full Setup — run all sections ──
     print_header("Configuration Location")
+    from hermes_constants import (
+        get_managed_node_root,
+        get_node_workspace_root,
+        is_managed_install,
+    )
+
     print_info(f"Config file:  {get_config_path()}")
     print_info(f"Secrets file: {get_env_path()}")
     print_info(f"Data folder:  {hermes_home}")
     print_info(f"Install dir:  {PROJECT_ROOT}")
+    print_info(f"Hermes Data Root: {hermes_home}")
+    print_info(f"Node Workspace: {get_node_workspace_root()}")
+    print_info(f"Managed Node: {get_managed_node_root()}")
+    print_info(f"Managed Install: {'true' if is_managed_install() else 'false'}")
     print()
     print_info("You can edit these files directly or use 'hermes config edit'")
 

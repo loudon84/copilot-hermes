@@ -9075,6 +9075,28 @@ def cmd_update(args):
         managed_error,
         recommended_update_command_for_method,
     )
+    from hermes_constants import is_managed_install
+
+    if is_managed_install():
+        if getattr(args, "check", False):
+            from hermes_cli.runtime_errors import (
+                collect_runtime_plane_issues,
+                runtime_issues_summary,
+            )
+
+            issues = collect_runtime_plane_issues()
+            if issues:
+                for line in runtime_issues_summary(issues):
+                    print(line)
+                sys.exit(1)
+            print("Hermes runtime is managed by SMC. No runtime-plane issues detected.")
+            return
+        print(
+            "Hermes runtime is managed by SMC.\n"
+            "Use OPSI deployment to update Hermes.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if is_managed():
         managed_error("update Hermes Agent")

@@ -2834,6 +2834,18 @@ def _append_node_dir_for_service(
         path_entries.append(resolved_node_dir)
 
 
+def _systemd_managed_runtime_env_lines() -> str:
+    from hermes_constants import managed_runtime_env_overrides
+
+    lines = [
+        f'Environment="{key}={value}"'
+        for key, value in managed_runtime_env_overrides().items()
+    ]
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = _stable_service_working_dir()
@@ -2912,7 +2924,7 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
-Restart=always
+{_systemd_managed_runtime_env_lines()}Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
@@ -2950,7 +2962,7 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
-Restart=always
+{_systemd_managed_runtime_env_lines()}Restart=always
 RestartSec=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}

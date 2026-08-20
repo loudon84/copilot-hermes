@@ -60,17 +60,31 @@ def _has_system_browser() -> bool:
 
 
 def _has_hermes_agent_browser() -> bool:
-    from hermes_constants import get_hermes_home
-    home = get_hermes_home()
-    if _IS_WINDOWS:
-        # npm -g --prefix puts .cmd shims directly in the prefix dir on Windows
-        return (home / "node" / "agent-browser.cmd").is_file()
-    # install.sh installs globally into $HERMES_HOME/node/bin/ via npm -g --prefix
-    # Also check legacy node_modules/.bin/ path for git-clone installs.
-    return (
-        (home / "node" / "bin" / "agent-browser").is_file()
-        or (home / "node_modules" / ".bin" / "agent-browser").is_file()
+    from hermes_constants import (
+        get_managed_node_root,
+        get_node_workspace_root,
     )
+
+    workspace = get_node_workspace_root()
+    local_bin_dir = workspace / "node_modules" / ".bin"
+    if local_bin_dir.is_dir():
+        local_which = shutil.which("agent-browser", path=str(local_bin_dir))
+        if local_which and agent_browser_runnable(local_which):
+            return True
+
+    node_root = get_managed_node_root()
+    if _IS_WINDOWS:
+        legacy = node_root / "agent-browser.cmd"
+        if legacy.is_file() and agent_browser_runnable(str(legacy)):
+            return True
+    legacy_bin = node_root / "bin" / "agent-browser"
+    if legacy_bin.is_file() and agent_browser_runnable(str(legacy_bin)):
+        return True
+    managed_hit = shutil.which("agent-browser", path=str(node_root / "bin"))
+    if managed_hit and agent_browser_runnable(managed_hit):
+        return True
+    managed_hit = shutil.which("agent-browser", path=str(node_root))
+    return bool(managed_hit and agent_browser_runnable(managed_hit))
 
 
 def _find_install_script(

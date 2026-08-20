@@ -63,6 +63,30 @@ test('managed Node dirs are empty without a Hermes home', () => {
   assert.deepEqual(hermesManagedNodePathEntries('', { platform: 'win32', pathModule: path.win32 }), [])
 })
 
+test('HERMES_AGENT_ROOT overrides HERMES_HOME for managed Node dirs', () => {
+  const agentRoot = 'D:\\Programs\\SMC\\Hermes\\node\\hermes-agent'
+  const nodeRoot = 'D:\\Programs\\SMC\\Hermes\\node'
+  const binRoot = 'D:\\Programs\\SMC\\Hermes\\node\\bin'
+
+  assert.deepEqual(
+    hermesManagedNodePathEntries('C:\\ProgramData\\SMC\\Hermes', {
+      platform: 'win32',
+      pathModule: path.win32,
+      agentRoot
+    }),
+    [nodeRoot, binRoot]
+  )
+
+  assert.deepEqual(
+    hermesManagedNodePathEntries('/Users/test/.hermes/profiles/writer', {
+      platform: 'darwin',
+      pathModule: path.posix,
+      agentRoot: '/opt/programs/hermes/node/hermes-agent'
+    }),
+    ['/opt/programs/hermes/node/bin', '/opt/programs/hermes/node']
+  )
+})
+
 test('every managed Node dir outranks the inherited PATH on both platforms', () => {
   for (const [platform, pathModule, home, inherited, delimiter] of [
     ['darwin', path.posix, '/Users/test/.hermes', '/usr/local/bin:/usr/bin', ':'],

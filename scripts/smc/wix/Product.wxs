@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="SMC Hermes Agent"
+    Manufacturer="SMC"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="B1C2D3E4-F5A6-7890-ABCD-EF1234567890"
+    Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of SMC Hermes Agent is already installed." />
+
+    <Feature Id="MainFeature" Title="SMC Hermes Agent Runtime">
+      <ComponentGroupRef Id="RuntimeTree" />
+    </Feature>
+
+    <!-- Canonical SMC layout: D:\Programs\SMC\Hermes -->
+    <Directory Id="TARGETROOT" Name="D:">
+      <Directory Id="ProgramsDir" Name="Programs">
+        <Directory Id="SMCDir" Name="SMC">
+          <Directory Id="INSTALLFOLDER" Name="Hermes" />
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="HermesDataDir" Name="SMC">
+        <Directory Id="HERMESHOMEDIR" Name="Hermes" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="RuntimeTree" Directory="INSTALLFOLDER">
+      <Files Include="$(var.RuntimeSourceRoot)\**" />
+    </ComponentGroup>
+
+    <Component Id="ManagedEnv" Directory="INSTALLFOLDER" Guid="A1B2C3D4-E5F6-7890-1234-567890ABCDEF">
+      <Environment Id="EnvHermesHome" Name="HERMES_HOME" Value="$(var.HermesHome)" Action="set" System="yes" />
+      <Environment Id="EnvAgentRoot" Name="HERMES_AGENT_ROOT" Value="$(var.ProgramRoot)\node\hermes-agent" Action="set" System="yes" />
+      <Environment Id="EnvManaged" Name="HERMES_MANAGED_INSTALL" Value="1" Action="set" System="yes" />
+      <Environment Id="EnvPath" Name="PATH" Value="[INSTALLFOLDER]bin" Action="set" Part="last" System="yes" />
+      <CreateFolder />
+    </Component>
+
+    <Component Id="HermesDataRoot" Directory="HERMESHOMEDIR" Guid="B2C3D4E5-F6A7-8901-2345-678901ABCDEF">
+      <CreateFolder />
+    </Component>
+  </Package>
+</Wix>

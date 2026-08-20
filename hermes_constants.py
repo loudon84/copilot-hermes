@@ -282,17 +282,79 @@ def get_hermes_dir(
     return home / new_subpath
 
 
+class ManagedRuntimeError(RuntimeError):
+    """Raised when a mutation of the SMC-managed program plane is attempted."""
+
+
+_MANAGED_INSTALL_TRUE = frozenset({"1", "true", "yes", "on"})
+
+
+def is_managed_install() -> bool:
+    """Return True when the runtime is owned by an external enterprise installer."""
+    return (
+        os.environ.get("HERMES_MANAGED_INSTALL", "").strip().lower()
+        in _MANAGED_INSTALL_TRUE
+    )
+
+
+def get_node_workspace_root() -> Path:
+    """Return the Hermes Node workspace root (``package.json`` / ``node_modules``).
+
+    When ``HERMES_AGENT_ROOT`` is set (SMC managed mode), that path is the
+    workspace. Otherwise fall back to the repository / package root so
+    developer checkouts keep working without env injection.
+    """
+    configured = os.environ.get("HERMES_AGENT_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(__file__).resolve().parent
+
+
+def get_managed_node_root(home: Path | None = None) -> Path:
+    """Return the Hermes-managed Node runtime directory (``node.exe`` / ``npm``).
+
+    When ``HERMES_AGENT_ROOT`` is set, the Node runtime lives in its parent
+    (``…/node/hermes-agent`` → ``…/node``). Otherwise fall back to
+    ``$HERMES_HOME/node`` for upstream / developer compatibility.
+    """
+    configured = os.environ.get("HERMES_AGENT_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve().parent
+    return (home or get_hermes_home()) / "node"
+
+
+def get_program_root() -> Path | None:
+    """Return the program plane root when ``HERMES_AGENT_ROOT`` is configured."""
+    configured = os.environ.get("HERMES_AGENT_ROOT", "").strip()
+    if not configured:
+        return None
+    return Path(configured).expanduser().resolve().parent.parent
+
+
+def managed_runtime_env_overrides() -> dict[str, str]:
+    """Return managed-runtime env vars to propagate to child processes."""
+    overrides: dict[str, str] = {}
+    agent_root = os.environ.get("HERMES_AGENT_ROOT", "").strip()
+    if agent_root:
+        overrides["HERMES_AGENT_ROOT"] = agent_root
+    managed = os.environ.get("HERMES_MANAGED_INSTALL", "").strip()
+    if managed:
+        overrides["HERMES_MANAGED_INSTALL"] = managed
+    return overrides
+
+
 def iter_hermes_node_dirs(home: Path | None = None) -> list[Path]:
     """Return Hermes-managed Node.js directories in preferred lookup order.
 
     Windows installs from ``scripts/install.ps1`` unpack portable Node directly
     into ``%LOCALAPPDATA%\\hermes\\node``. POSIX installs use
-    ``$HERMES_HOME/node/bin``. Include both shapes on every platform so mixed
-    or migrated installs still work.
+    ``$HERMES_HOME/node/bin``. SMC managed installs use ``HERMES_AGENT_ROOT``'s
+    parent. Include both ``node`` and ``node/bin`` shapes on every platform so
+    mixed or migrated installs still work.
     """
-    root = home or get_hermes_home()
-    dirs = [root / "node"]
-    bin_dir = root / "node" / "bin"
+    node_root = get_managed_node_root(home)
+    dirs = [node_root]
+    bin_dir = node_root / "bin"
     # NOTE: keep this ordering in sync with hermesManagedNodePathEntries() in
     # apps/desktop/electron/backend-env.ts — the Electron main process is Node
     # and cannot import this module, so the platform-ordering rule is mirrored
@@ -393,7 +455,6 @@ def _heal_managed_node_windows() -> bool:
     else:
         return False
 
-    home = get_hermes_home()
     index_url = f"https://nodejs.org/dist/latest-v{_HERMES_NODE_TARGET_MAJOR}.x/"
     try:
         with urllib.request.urlopen(index_url, timeout=60) as response:
@@ -428,7 +489,7 @@ def _heal_managed_node_windows() -> bool:
             extracted = next(extract_dir.glob("node-v*"), None)
             if extracted is None or not extracted.is_dir():
                 return False
-            target = home / "node"
+            target = get_managed_node_root()
             if target.exists():
                 shutil.rmtree(target)
             shutil.move(str(extracted), str(target))
@@ -487,8 +548,11 @@ def bootstrap_hermes_managed_node() -> str | None:
 
     Returns the managed npm executable path on success, ``None`` on failure.
     No-ops (returning the existing npm) when a healthy managed tree is already
-    present.
+    present. In SMC managed-install mode the program plane is read-only and
+    this function never downloads or overwrites Node.
     """
+    if is_managed_install():
+        return find_hermes_node_executable("npm")
     existing = find_hermes_node_executable("npm")
     if existing:
         return existing
@@ -518,7 +582,12 @@ def heal_hermes_managed_node() -> bool:
     Runs at most once per process. POSIX installs shell out to
     ``heal_managed_node`` in ``scripts/lib/node-bootstrap.sh``; Windows
     downloads the portable zip directly (same source as ``install.ps1``).
+
+    In SMC managed-install mode the program plane is read-only — this function
+    never downloads, deletes, or overwrites Node; repair is delegated to OPSI.
     """
+    if is_managed_install():
+        return False
     global _managed_node_heal_attempted
     if _managed_node_heal_attempted:
         return False

@@ -98,6 +98,11 @@ class TestGetProcessHermesHome:
 
 
 class TestHermesManagedNode:
+    @pytest.fixture(autouse=True)
+    def _developer_node_layout(self, monkeypatch):
+        monkeypatch.delenv("HERMES_AGENT_ROOT", raising=False)
+        monkeypatch.delenv("HERMES_MANAGED_INSTALL", raising=False)
+
     def test_windows_node_dir_prefers_portable_root(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
         node_dir = home / "node"
@@ -152,6 +157,11 @@ class TestHermesManagedNode:
 @pytest.mark.skipif(os.name == "nt", reason="POSIX shell stubs; Windows uses .cmd shims")
 class TestNodeToolRunnable:
     """node_tool_runnable() rejects broken Hermes-managed npm/node wrappers."""
+
+    @pytest.fixture(autouse=True)
+    def _developer_node_layout(self, monkeypatch):
+        monkeypatch.delenv("HERMES_AGENT_ROOT", raising=False)
+        monkeypatch.delenv("HERMES_MANAGED_INSTALL", raising=False)
 
     def _stub(self, tmp_path, name, body, mode=0o755):
         path = tmp_path / name

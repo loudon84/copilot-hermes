@@ -1628,13 +1628,43 @@ def _run_cua_driver_installer(
                 pass
 
 
+def _node_workspace_root() -> Path:
+    from hermes_constants import get_node_workspace_root
+
+    return get_node_workspace_root()
+
+
+def _managed_runtime_repair_lines() -> list[str]:
+    workspace = _node_workspace_root()
+    return [
+        "Hermes Node runtime is managed by SMC.",
+        f"Node workspace: {workspace}",
+        "Repair action: Run SMC Hermes repair through OPSI.",
+    ]
+
+
+def _developer_npm_install_hint() -> str:
+    return f"cd {_node_workspace_root()} && npm install --workspaces=false"
+
+
+def _assert_runtime_npm_allowed() -> None:
+    from hermes_constants import ManagedRuntimeError, is_managed_install
+
+    if is_managed_install():
+        raise ManagedRuntimeError(
+            "Node dependencies are managed by SMC. Run OPSI repair."
+        )
+
+
 def _run_post_setup(post_setup_key: str):
     """Run post-setup hooks for tools that need extra installation steps."""
     import shutil
-    from hermes_constants import find_node_executable
+    from hermes_constants import find_node_executable, is_managed_install
+
+    node_workspace = _node_workspace_root()
 
     if post_setup_key in {"agent_browser", "browserbase"}:
-        node_modules = PROJECT_ROOT / "node_modules" / "agent-browser"
+        node_modules = node_workspace / "node_modules" / "agent-browser"
         # Managed Node first — $HERMES_HOME/node is not on PATH, so a bare
         # which() reports "no npm" on installs whose only Node is the one
         # Hermes installed for exactly this toolchain.
@@ -1642,8 +1672,19 @@ def _run_post_setup(post_setup_key: str):
         npx_bin = find_node_executable("npx")
         # Step 1: install the agent-browser npm package into node_modules/
         if not node_modules.exists() and npm_bin:
+            from hermes_constants import ManagedRuntimeError
+
+            if is_managed_install():
+                for line in _managed_runtime_repair_lines():
+                    _print_warning(f"    {line}")
+                return
             _print_info("    Installing Node.js dependencies for browser tools...")
             import subprocess
+            try:
+                _assert_runtime_npm_allowed()
+            except ManagedRuntimeError as exc:
+                _print_warning(f"    {exc}")
+                return
             # Use the resolved npm_bin absolute path so subprocess.Popen can
             # execute npm.cmd on Windows (CreateProcessW otherwise rejects
             # batch shims).  On POSIX npm_bin is the plain path — same
@@ -1653,14 +1694,15 @@ def _run_post_setup(post_setup_key: str):
                 # only, avoiding the apps/* glob which would pull in
                 # apps/desktop (Electron + node-pty) unnecessarily. See #38772.
                 [npm_bin, "install", "--silent", "--workspaces=false"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT),
+                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(node_workspace),
                 creationflags=_post_setup_no_window_flags(),
             )
             if result.returncode == 0:
                 _print_success("    Node.js dependencies installed")
             else:
-                from hermes_constants import display_hermes_home
-                _print_warning(f"    npm install failed - run manually: cd {display_hermes_home()}/hermes-agent && npm install --workspaces=false")
+                _print_warning(
+                    f"    npm install failed - run manually: {_developer_npm_install_hint()}"
+                )
                 if result.stderr:
                     _print_info(f"      {result.stderr.strip()[:200]}")
         elif node_modules.exists():
@@ -1668,7 +1710,13 @@ def _run_post_setup(post_setup_key: str):
             # the truth ("nothing to do") instead of implying a fresh install.
             _print_success("    agent-browser already installed, nothing to do")
         else:
-            _print_warning("    Node.js not found - browser tools require: npm install (in hermes-agent directory)")
+            if is_managed_install():
+                for line in _managed_runtime_repair_lines():
+                    _print_warning(f"    {line}")
+            else:
+                _print_warning(
+                    f"    Node.js not found - browser tools require: {_developer_npm_install_hint()}"
+                )
             return
 
         # Step 2: only the local browser provider actually needs Chromium on
@@ -1720,7 +1768,7 @@ def _run_post_setup(post_setup_key: str):
         # Prefer the bundled agent-browser install subcommand so the
         # version of Chromium matches the CLI. Fall back to npx shim on
         # setups where the local bin stub isn't present.
-        local_ab = PROJECT_ROOT / "node_modules" / ".bin" / "agent-browser"
+        local_ab = node_workspace / "node_modules" / ".bin" / "agent-browser"
         if sys.platform == "win32":
             local_ab_win = local_ab.with_suffix(".cmd")
             if local_ab_win.exists():
@@ -1733,7 +1781,7 @@ def _run_post_setup(post_setup_key: str):
         try:
             result = subprocess.run(
                 install_cmd,
-                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT), timeout=600,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(node_workspace), timeout=600,
                 creationflags=_post_setup_no_window_flags(),
             )
             if result.returncode == 0:
@@ -1756,10 +1804,13 @@ def _run_post_setup(post_setup_key: str):
             _print_info("    Run manually: npx agent-browser install --with-deps")
 
     elif post_setup_key == "camofox":
-        camofox_dir = PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser"
+        camofox_dir = node_workspace / "node_modules" / "@askjo" / "camofox-browser"
         _npm_bin = find_node_executable("npm")
         if camofox_dir.exists():
             _print_success("    Camofox already installed, nothing to do")
+        elif is_managed_install():
+            for line in _managed_runtime_repair_lines():
+                _print_warning(f"    {line}")
         elif _npm_bin:
             _print_info("    Installing Camofox browser server...")
             import subprocess
@@ -1767,13 +1818,15 @@ def _run_post_setup(post_setup_key: str):
             result = subprocess.run(
                 # --workspaces=false avoids resolving apps/desktop. See #38772.
                 [_npm_bin, "install", "--silent", "--workspaces=false"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT),
+                capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(node_workspace),
                 creationflags=_post_setup_no_window_flags(),
             )
             if result.returncode == 0:
                 _print_success("    Camofox installed")
             else:
-                _print_warning("    npm install failed - run manually: npm install --workspaces=false")
+                _print_warning(
+                    f"    npm install failed - run manually: {_developer_npm_install_hint()}"
+                )
         if camofox_dir.exists():
             _print_info("    Start the Camofox server:")
             _print_info("      npx @askjo/camofox-browser")
@@ -3252,7 +3305,7 @@ def _agent_browser_installed() -> bool:
 def _camofox_installed() -> bool:
     """True when the Camofox npm package ``_run_post_setup("camofox")``
     installs is already in node_modules."""
-    return (PROJECT_ROOT / "node_modules" / "@askjo" / "camofox-browser").exists()
+    return (_node_workspace_root() / "node_modules" / "@askjo" / "camofox-browser").exists()
 
 
 # post_setup_key -> predicate(): True when the install side-effect is already

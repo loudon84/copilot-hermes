@@ -752,6 +752,30 @@ def run_doctor(args):
     print(color("│                 🩺 Hermes Doctor                        │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
 
+    from hermes_constants import (
+        get_managed_node_root,
+        get_node_workspace_root,
+        get_program_root,
+        is_managed_install,
+    )
+    from hermes_cli.runtime_errors import collect_runtime_plane_issues, format_runtime_issue
+
+    if is_managed_install():
+        _section("Runtime Plane")
+        check_info("Runtime Mode: Managed")
+        check_info(f"Hermes Home: {HERMES_HOME}")
+        program_root = get_program_root()
+        if program_root:
+            check_info(f"Program Root: {program_root}")
+        check_info(f"Node Runtime: {get_managed_node_root()}")
+        check_info(f"Node Workspace: {get_node_workspace_root()}")
+        runtime_issues = collect_runtime_plane_issues()
+        for issue in runtime_issues:
+            check_fail(format_runtime_issue(issue))
+            manual_issues.append(format_runtime_issue(issue))
+        if not runtime_issues:
+            check_ok("Runtime plane layout")
+
     _section("Security Advisories")
     try:
         from hermes_cli.security_advisories import (
@@ -1883,10 +1907,15 @@ def run_doctor(args):
             check_info("Vercel persistence: ephemeral filesystem")
 
     # Node.js + agent-browser (for browser automation tools)
+    from hermes_constants import get_managed_node_root, get_node_workspace_root, is_managed_install
+
+    node_workspace = get_node_workspace_root()
+    managed_node_root = get_managed_node_root()
+
     if _safe_which("node"):
         check_ok("Node.js")
         # Check if agent-browser is installed
-        agent_browser_path = PROJECT_ROOT / "node_modules" / "agent-browser"
+        agent_browser_path = node_workspace / "node_modules" / "agent-browser"
         agent_browser_ok = False
         _which_ab = shutil.which("agent-browser")
         # `hermes acp --setup-browser` installs agent-browser into the
@@ -1905,20 +1934,20 @@ def run_doctor(args):
                 return None
 
         _managed_ab = (
-            _which_in(HERMES_HOME / "node" / "bin")
-            or _which_in(HERMES_HOME / "node")
+            _which_in(managed_node_root / "bin")
+            or _which_in(managed_node_root)
         )
-        _legacy_ab = _which_in(HERMES_HOME / "node_modules" / ".bin")
+        _workspace_ab = _which_in(node_workspace / "node_modules" / ".bin")
         if agent_browser_path.exists():
             check_ok("agent-browser (Node.js)", "(browser automation)")
+            agent_browser_ok = True
+        elif _workspace_ab and agent_browser_runnable(_workspace_ab):
+            check_ok("agent-browser", "(browser automation)")
             agent_browser_ok = True
         elif _which_ab and agent_browser_runnable(_which_ab):
             check_ok("agent-browser", "(browser automation)")
             agent_browser_ok = True
         elif _managed_ab and agent_browser_runnable(_managed_ab):
-            check_ok("agent-browser", "(browser automation)")
-            agent_browser_ok = True
-        elif _legacy_ab and agent_browser_runnable(_legacy_ab):
             check_ok("agent-browser", "(browser automation)")
             agent_browser_ok = True
         elif _which_ab:
@@ -1936,7 +1965,13 @@ def run_doctor(args):
             for step in _termux_browser_setup_steps(node_installed=True):
                 check_info(step)
         else:
-            check_warn("agent-browser not installed", "(run: npm install)")
+            if is_managed_install():
+                check_warn(
+                    "agent-browser not installed",
+                    "(Run SMC Hermes repair through OPSI)",
+                )
+            else:
+                check_warn("agent-browser not installed", "(run: npm install)")
 
         # Chromium presence — the browser tools silently fail to register when
         # agent-browser is found but no Playwright-managed Chromium is on disk

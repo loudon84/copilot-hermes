@@ -142,15 +142,48 @@ _UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 _OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
 
-def _canonical_github_remote(url: str | None) -> str:
-    """Return ``host/owner/repo`` for common GitHub remote URL forms."""
+def _enterprise_official_identity() -> Optional[dict]:
+    """Load enterprise official-source.json when present."""
+    try:
+        from hermes_cli.official_source import (
+            get_active_hermes_home,
+            read_official_source,
+        )
+
+        return read_official_source(get_active_hermes_home())
+    except Exception:
+        return None
+
+
+def _enterprise_upstream_url() -> Optional[str]:
+    data = _enterprise_official_identity()
+    if not data:
+        return None
+    install = data.get("installUrl")
+    if isinstance(install, str) and install.strip():
+        return install.strip()
+    origins = data.get("originUrls")
+    if isinstance(origins, dict):
+        for key in ("http", "https", "ssh"):
+            value = origins.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _canonical_remote(url: str | None) -> str:
+    """Return ``host/owner/repo`` for common git remote URL forms."""
     if not url:
         return ""
     value = url.strip()
-    if value.startswith("git@github.com:"):
-        value = "github.com/" + value[len("git@github.com:"):]
-    elif value.startswith("ssh://git@github.com/"):
-        value = "github.com/" + value[len("ssh://git@github.com/"):]
+    if value.startswith("git@") and ":" in value:
+        host, _, path = value[len("git@") :].partition(":")
+        value = f"{host}/{path}"
+    elif value.startswith("ssh://"):
+        parsed = urlparse(value)
+        if parsed.netloc and parsed.path:
+            host = parsed.netloc.split("@")[-1]
+            value = f"{host}{parsed.path}"
     else:
         parsed = urlparse(value)
         if parsed.netloc and parsed.path:
@@ -161,6 +194,11 @@ def _canonical_github_remote(url: str | None) -> str:
     return value.lower()
 
 
+def _canonical_github_remote(url: str | None) -> str:
+    """Return ``host/owner/repo`` for common GitHub remote URL forms."""
+    return _canonical_remote(url)
+
+
 def _is_ssh_remote(url: str | None) -> bool:
     if not url:
         return False
@@ -169,7 +207,31 @@ def _is_ssh_remote(url: str | None) -> bool:
 
 
 def _is_official_ssh_remote(url: str | None) -> bool:
+    enterprise = _enterprise_official_identity()
+    if enterprise:
+        from hermes_cli.official_source import official_urls_from_source
+
+        urls = official_urls_from_source(enterprise)
+        if not urls:
+            return False
+        canonical = _canonical_remote(url)
+        return _is_ssh_remote(url) and any(
+            _canonical_remote(u) == canonical for u in urls
+        )
     return _is_ssh_remote(url) and _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL
+
+
+def _is_official_origin(url: str | None) -> bool:
+    """True when origin matches enterprise official URLs or NousResearch."""
+    if not url:
+        return False
+    enterprise = _enterprise_official_identity()
+    if enterprise:
+        from hermes_cli.official_source import official_urls_from_source
+
+        canonical = _canonical_remote(url)
+        return any(_canonical_remote(u) == canonical for u in official_urls_from_source(enterprise))
+    return _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL
 
 
 def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str]:
@@ -196,14 +258,11 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
 def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
     """Exact behind-count via the GitHub compare API for uncountable graphs.
 
-    Shallow installer clones and ls-remote-only probes know the two tip SHAs
-    but have no local history to run ``rev-list --count`` across. GitHub's
-    ``GET /repos/<owner>/<repo>/compare/<current>...<target>`` knows the full
-    graph regardless of local clone depth and returns ``ahead_by`` — exactly
-    the behind count the local graph lost. Unauthenticated, bounded, and
-    best-effort: any failure (offline, rate limit, diverged/unknown SHAs)
-    returns None so callers keep the honest UPDATE_AVAILABLE_NO_COUNT.
+    Disabled when enterprise official-source.json is present — never call
+    api.github.com/nousresearch on enterprise endpoints.
     """
+    if _enterprise_official_identity():
+        return None
     if not (_is_full_sha(current_rev) and _is_full_sha(target_rev)):
         return None
     url = (
@@ -241,9 +300,15 @@ def _is_full_sha(value: Optional[str]) -> bool:
 
 def _upstream_main_sha() -> Optional[str]:
     """Tip SHA of upstream main via HTTPS ls-remote (no auth, no prompts)."""
+    upstream_url = _enterprise_upstream_url() or _UPSTREAM_REPO_URL
+    # Prefer origin default branch when enterprise identity is present.
+    branch = "main"
+    enterprise = _enterprise_official_identity()
+    if enterprise and isinstance(enterprise.get("defaultBranch"), str):
+        branch = enterprise["defaultBranch"].strip() or "main"
     try:
         result = subprocess.run(
-            ["git", "ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"],
+            ["git", "ls-remote", upstream_url, f"refs/heads/{branch}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=10,
         )
@@ -278,7 +343,9 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     """Count commits behind origin/main in a local checkout."""
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
+    # Enterprise official identity OR official SSH: prefer ls-remote against
+    # official installUrl / origin, never api.github.com/nousresearch.
+    if _is_official_origin(origin_url) or _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         if not head_rev:
             return None
@@ -302,8 +369,8 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         if ancestor.returncode == 0:
             return 0
         # Genuinely behind (or diverged). Recover the exact count via the
-        # GitHub compare API; a local-only HEAD 404s there, which safely
-        # degrades to the honest no-count sentinel — never a fabricated 1.
+        # GitHub compare API only for public Nous installs; enterprise
+        # degrades to the honest no-count sentinel.
         counted = _github_compare_behind(head_rev, upstream_rev)
         return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
@@ -607,12 +674,17 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
     """Return ``(tag, release_url)`` for the latest git tag, or None.
 
     Local-only — runs ``git describe --tags --abbrev=0`` against the
-    Hermes checkout. Cached per-process. Release URL always points at the
-    canonical NousResearch/hermes-agent repo (forks don't get a link).
+    Hermes checkout. Cached per-process. Release URL points at the
+    canonical NousResearch repo only when no enterprise official identity
+    is present (forks / enterprise installs don't get a public link).
     """
     global _latest_release_cache
     if _latest_release_cache is not None:
         return _latest_release_cache or None
+
+    if _enterprise_official_identity():
+        _latest_release_cache = ()
+        return None
 
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:

@@ -72,7 +72,11 @@ param(
     #   * The canonical CLI one-liner (irm | iex) omits the flag too;
     #     terminal users don't need a desktop binary built for them, and
     #     `hermes desktop` already builds on demand.
-    [switch]$IncludeDesktop
+    [switch]$IncludeDesktop,
+
+    # Enterprise / Work Bootstrap override. When set, clone uses this URL
+    # (both SSH and HTTPS attempt paths). Empty → enterprise HTTP default.
+    [string]$RepoUrl = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -383,8 +387,16 @@ $script:ResolvedPathReport = @{
 # Configuration
 # ============================================================================
 
-$RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
-$RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
+# Enterprise fork defaults (SMC). Public NousResearch URLs are not used on
+# endpoint installs. -RepoUrl overrides both SSH/HTTPS clone targets.
+$EnterpriseDefaultRepoUrl = "http://git.superic.com/aiplatform/hermes-agent.git"
+if ($RepoUrl -and $RepoUrl.Trim()) {
+    $RepoUrlSsh = $RepoUrl.Trim()
+    $RepoUrlHttps = $RepoUrl.Trim()
+} else {
+    $RepoUrlSsh = $EnterpriseDefaultRepoUrl
+    $RepoUrlHttps = $EnterpriseDefaultRepoUrl
+}
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -2362,120 +2374,38 @@ function Install-Repository {
         $env:GIT_CONFIG_VALUE_0 = "false"
         git config --global windows.appendAtomically false 2>$null
 
-        # Try SSH first, then HTTPS, with -c flag for atomic write fix
-        Write-Info "Trying SSH clone..."
-        $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
-        try {
-            Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlSsh $InstallDir }
-            if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
-        } catch { }
-        $env:GIT_SSH_COMMAND = $null
+        # Clone via configured enterprise / -RepoUrl targets only. No GitHub ZIP
+        # fallback — endpoint installs must fail closed on clone failure.
+        $cloneUrls = @()
+        if ($RepoUrlSsh -and $RepoUrlSsh -ne $RepoUrlHttps) {
+            $cloneUrls += $RepoUrlSsh
+        }
+        $cloneUrls += $RepoUrlHttps
+        $cloneUrls = $cloneUrls | Select-Object -Unique
 
-        if (-not $cloneSuccess) {
-            if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Info "SSH failed, trying HTTPS..."
+        foreach ($cloneUrl in $cloneUrls) {
+            if ($cloneSuccess) { break }
+            if (Test-Path $InstallDir) {
+                Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
+            }
+            $isSsh = ($cloneUrl -match '^git@' -or $cloneUrl -match '^ssh://')
+            if ($isSsh) {
+                Write-Info "Trying SSH clone from $cloneUrl ..."
+                $env:GIT_SSH_COMMAND = "ssh -o BatchMode=yes -o ConnectTimeout=5"
+            } else {
+                Write-Info "Trying git clone from $cloneUrl ..."
+            }
             try {
-                Invoke-NativeWithRelaxedErrorAction { git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $RepoUrlHttps $InstallDir }
+                Invoke-NativeWithRelaxedErrorAction {
+                    git -c windows.appendAtomically=false clone --depth 1 --branch $Branch $cloneUrl $InstallDir
+                }
                 if ($LASTEXITCODE -eq 0) { $cloneSuccess = $true }
             } catch { }
-        }
-
-        # Fallback: download ZIP archive (bypasses git file I/O issues entirely)
-        if (-not $cloneSuccess) {
-            if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-            Write-Warn "Git clone failed -- downloading ZIP archive instead..."
-            try {
-                # Pick the ZIP URL for the most-specific ref the caller asked
-                # for.  GitHub supports archive URLs for commits, tags, and
-                # branches; we honour Commit > Tag > Branch.
-                if ($Commit) {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/$Commit.zip"
-                    $zipLabel = $Commit
-                } elseif ($Tag) {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/tags/$Tag.zip"
-                    $zipLabel = $Tag
-                } else {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/$Branch.zip"
-                    $zipLabel = $Branch
-                }
-                $zipPath = "$env:TEMP\hermes-agent-$zipLabel.zip"
-                $extractPath = "$env:TEMP\hermes-agent-extract"
-
-                Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
-                if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
-                Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-
-                # GitHub ZIPs extract to repo-branch/ subdirectory
-                $extractedDir = Get-ChildItem $extractPath -Directory | Select-Object -First 1
-                if ($extractedDir) {
-                    New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir) -ErrorAction SilentlyContinue | Out-Null
-                    Move-Item $extractedDir.FullName $InstallDir -Force
-                    Write-Success "Downloaded and extracted"
-
-                    # Initialize git repo so updates work later. A bare
-                    # `git init` leaves NO HEAD -- desktop's write-build-stamp
-                    # then hard-fails with "could not determine git commit"
-                    # (#50823 / #61657). Fetch the requested ref and force-check
-                    # it out (-f) so untracked ZIP files cannot block checkout.
-                    Push-Location $InstallDir
-                    git -c windows.appendAtomically=false init 2>$null
-                    git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
-                    # Pin autocrlf=false BEFORE the checkout below. Git for Windows
-                    # defaults to core.autocrlf=true, which would renormalize the
-                    # repo's LF text files to CRLF in the working tree during
-                    # `checkout -f FETCH_HEAD` -- leaving this freshly-created
-                    # managed checkout dirty vs HEAD and aborting the next
-                    # `hermes update` (see the notes at the shared clone-path
-                    # config below and install.ps1:1461-1469). The later pin on
-                    # the shared path is idempotent and still covers git clones.
-                    git -c windows.appendAtomically=false config core.autocrlf false 2>$null
-                    git remote add origin $RepoUrlHttps 2>$null
-                    $fetchRef = if ($Commit) { $Commit } elseif ($Tag) { "refs/tags/$Tag" } else { $Branch }
-                    Write-Info "Fetching $fetchRef so the ZIP checkout has a resolvable HEAD..."
-                    $prevZipEAP = $ErrorActionPreference
-                    $ErrorActionPreference = "Continue"
-                    try {
-                        git -c windows.appendAtomically=false fetch --depth 1 origin $fetchRef 2>&1 | Out-Null
-                        if ($LASTEXITCODE -eq 0) {
-                            if ($Commit -or $Tag) {
-                                git -c windows.appendAtomically=false checkout -f --detach FETCH_HEAD 2>&1 | Out-Null
-                            } else {
-                                git -c windows.appendAtomically=false checkout -f -B $Branch FETCH_HEAD 2>&1 | Out-Null
-                            }
-                            if ($LASTEXITCODE -eq 0) {
-                                Write-Success "ZIP checkout pinned to $fetchRef"
-                            } else {
-                                # Checkout blocked, but FETCH_HEAD still has a SHA we can stamp with.
-                                $fetchSha = & git -c windows.appendAtomically=false rev-parse FETCH_HEAD 2>$null
-                                if ($LASTEXITCODE -eq 0 -and $fetchSha) {
-                                    if (-not $env:GITHUB_SHA) { $env:GITHUB_SHA = ("$fetchSha").Trim() }
-                                    Write-Warn "ZIP checkout failed; seeded GITHUB_SHA from FETCH_HEAD for desktop stamp"
-                                } else {
-                                    Write-Warn "ZIP extract succeeded but git checkout failed -- desktop build may need `$env:GITHUB_SHA"
-                                }
-                            }
-                        } else {
-                            Write-Warn "ZIP extract succeeded but git fetch of $fetchRef failed -- desktop build may need `$env:GITHUB_SHA"
-                        }
-                    } finally {
-                        $ErrorActionPreference = $prevZipEAP
-                    }
-                    Pop-Location
-                    Write-Success "Git repo initialized for future updates"
-
-                    $cloneSuccess = $true
-                }
-
-                # Cleanup temp files
-                Remove-Item -Force $zipPath -ErrorAction SilentlyContinue
-                Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
-            } catch {
-                Write-Err "ZIP download also failed: $_"
-            }
+            if ($isSsh) { $env:GIT_SSH_COMMAND = $null }
         }
 
         if (-not $cloneSuccess) {
-            throw "Failed to download repository (tried git clone SSH, HTTPS, and ZIP)"
+            throw "Failed to clone repository from configured RepoUrl (ZIP fallback removed for enterprise installs)"
         }
     }
 
@@ -2854,32 +2784,35 @@ function Install-Dependencies {
     # previous venv is restored before the error propagates, and the parked
     # tree is deleted only after the imports prove the replacement usable.
     try {
+    # SMC enterprise extras (A-FORK-003). Prefer exact extra list over curated
+    # [all], which omits messaging/voice/edge-tts/hindsight.
+    $smcExtras = @(
+        "messaging", "mcp", "web", "google", "voice", "edge-tts", "hindsight"
+    )
+    $smcExtraArgs = @()
+    foreach ($extra in $smcExtras) {
+        $smcExtraArgs += "--extra"
+        $smcExtraArgs += $extra
+    }
+
     if (Test-Path "uv.lock") {
-        Write-Info "Trying tier: hash-verified (uv.lock) ..."
-        # Critical flag choice: `--extra all`, NOT `--all-extras`.
-        #   --all-extras = every [project.optional-dependencies] key,
-        #                  bypassing the curated [all] extra. On Windows
-        #                  that means [matrix] -> python-olm (no wheel,
-        #                  needs `make` to build from sdist) and the
-        #                  install fails.
-        #   --extra all  = just the [all] extra's contents (curated).
-        #
+        Write-Info "Trying tier: hash-verified SMC extras (uv.lock) ..."
+        # Critical: do NOT use --all-extras (pulls matrix/olm on Windows).
         # UV_PROJECT_ENVIRONMENT pins the sync target to our venv\.
-        # Without it, modern uv (>=0.5) ignores VIRTUAL_ENV for `sync`
-        # and creates a sibling .venv\ inside the repo -- leaving venv\
-        # empty and producing the broken state where `hermes.exe` exists
-        # in the wrong directory and imports fail with ModuleNotFoundError.
-        # (Mirrors the same flag in scripts/install.sh::install_deps.)
         $env:UV_PROJECT_ENVIRONMENT = "$InstallDir\venv"
-        Invoke-NativeWithRelaxedErrorAction { & $UvCmd sync --extra all --locked }
+        Invoke-NativeWithRelaxedErrorAction { & $UvCmd sync @smcExtraArgs --locked }
         if ($LASTEXITCODE -eq 0) {
-            Write-Success "Main package installed (hash-verified via uv.lock)"
-            $script:InstalledTier = "hash-verified (uv.lock)"
-            # Skip the rest of the tiered cascade -- we already have a
-            # complete, hash-verified install.
+            Write-Success "Main package installed (hash-verified SMC extras via uv.lock)"
+            $script:InstalledTier = "hash-verified SMC extras (uv.lock)"
             $skipPipFallback = $true
         } else {
-            Write-Warn "uv.lock sync failed (lockfile may be stale), falling back to PyPI resolve..."
+            Write-Warn "uv.lock SMC extras sync failed (lockfile may be stale), falling back..."
+            # Second attempt: curated [all] only as a bridge — still not PASS
+            # unless SMC extras resolve via pip tiers below.
+            Invoke-NativeWithRelaxedErrorAction { & $UvCmd sync --extra all --locked }
+            if ($LASTEXITCODE -eq 0) {
+                Write-Warn "uv sync --extra all succeeded but SMC extras still required; continuing to pip extras tiers"
+            }
             $skipPipFallback = $false
         }
     } else {
@@ -2887,27 +2820,13 @@ function Install-Dependencies {
         $skipPipFallback = $false
     }
 
-    # Install main package.  Tiered fallback so a single flaky transitive
-    # doesn't silently drop everything.  Each tier's stdout/stderr is
-    # preserved -- no Out-Null swallowing -- so the user can see what failed.
-    #
-    # Tier 1: [all] -- the curated extra in pyproject.toml.
-    # Tier 2: [all] minus the currently-broken extras list ($brokenExtras).
-    #         Edit $brokenExtras below when something on PyPI breaks; this
-    #         lets users keep the rest of [all] when one transitive is
-    #         unavailable. The list of [all]'s contents is parsed from
-    #         pyproject.toml at runtime -- there is NO hand-mirrored copy
-    #         to drift out of sync.
-    # Tier 3: bare `.` -- last-resort so at least the core CLI launches.
+    # Install main package. Fail closed: core-only is NOT success for enterprise.
+    # Tier 1: SMC extras list (messaging mcp web google voice edge-tts hindsight)
+    # Tier 2: [all] minus known-broken (bridge only)
+    # No core-only tier — A-FORK-003.
 
-    # Currently-broken extras. Edit this list when an upstream package
-    # gets quarantined / yanked / breaks resolution. Empty means everything
-    # in [all] should be installable; populate with the names of extras
-    # whose deps are temporarily unavailable.
     $brokenExtras = @()
 
-    # Parse [project.optional-dependencies].all from pyproject.toml.
-    # tomllib is stdlib on Python 3.11+ which the bootstrap guarantees.
     $pythonExeForParse = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
     $allExtras = @()
     if (Test-Path $pythonExeForParse) {
@@ -2936,11 +2855,11 @@ except Exception:
         $safeAll = ($allExtras | Where-Object { $brokenExtras -notcontains $_ }) -join ","
     }
     $brokenLabel = if ($brokenExtras) { ($brokenExtras -join ", ") } else { "none" }
+    $smcSpec = ".[$($smcExtras -join ',')]"
 
     $installTiers = @(
-        @{ Name = "all"; Spec = ".[all]" },
-        @{ Name = "all minus known-broken ($brokenLabel)"; Spec = ".[$safeAll]" },
-        @{ Name = "core only (no extras)"; Spec = "." }
+        @{ Name = "SMC extras ($($smcExtras -join ','))"; Spec = $smcSpec },
+        @{ Name = "all minus known-broken ($brokenLabel)"; Spec = ".[$safeAll]" }
     )
     $installed = $skipPipFallback
     if (-not $skipPipFallback) {
@@ -2948,16 +2867,21 @@ except Exception:
         Write-Info "Trying tier: $($tier.Name) ..."
         Invoke-NativeWithRelaxedErrorAction { & $UvCmd pip install -e $tier.Spec }
         if ($LASTEXITCODE -eq 0) {
-            Write-Success "Main package installed ($($tier.Name))"
-            $script:InstalledTier = $tier.Name
-            $installed = $true
-            break
+            if ($tier.Name -like "SMC extras*") {
+                Write-Success "Main package installed ($($tier.Name))"
+                $script:InstalledTier = $tier.Name
+                $installed = $true
+                break
+            }
+            # Bridge [all] succeeded but SMC extras did not — fail closed.
+            Write-Err "Tier '$($tier.Name)' installed but SMC extras are required; refusing core/[all]-only success."
+        } else {
+            Write-Warn "Tier '$($tier.Name)' failed (exit $LASTEXITCODE). Trying next tier..."
         }
-        Write-Warn "Tier '$($tier.Name)' failed (exit $LASTEXITCODE). Trying next tier..."
         }
     }
     if (-not $installed) {
-        throw "Failed to install hermes-agent package even with no extras. Inspect the uv pip install output above."
+        throw "Failed to install hermes-agent with required SMC extras ($($smcExtras -join ', ')). Core-only is not accepted."
     }
 
     # Baseline-import gate. Even if a tier reported success above, the

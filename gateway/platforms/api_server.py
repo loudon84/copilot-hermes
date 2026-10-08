@@ -3354,6 +3354,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_steer": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
+                # Stable call id + safe arguments/result on /v1/runs tool
+                # lifecycle events. Distinct from tool_progress_events, which
+                # only means basic progress visibility.
+                "run_tool_event_details_v1": True,
                 "approval_events": True,
                 "session_resources": True,
                 "model_options": True,

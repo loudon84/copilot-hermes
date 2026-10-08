@@ -1904,6 +1904,18 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     # completion line can report the transition (prime-agent#630 port).
     pre_update_version = _read_project_version()
 
+    # Enterprise endpoints must never pull public GitHub ZIP archives.
+    if _should_disable_public_upstream():
+        print(
+            "✗ Windows ZIP-fallback update is disabled for enterprise Hermes "
+            "(official-source.json / HERMES_ENTERPRISE_ENDPOINT / git.superic.com)."
+        )
+        print(
+            "  Fix local git file I/O and rerun `hermes update` against the "
+            "enterprise origin, or set HERMES_ALLOW_PUBLIC_UPSTREAM=1 (maintainer only)."
+        )
+        _m().sys.exit(1)
+
     # The ZIP fallback exists for Windows git-file-I/O breakage. It pulls a
     # static archive from GitHub, which is fine for the default "main"
     # channel but would silently ignore --branch and update from main even
@@ -2848,7 +2860,70 @@ OFFICIAL_REPO_URLS = {
 
 OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
 
+# Maintainer override: set HERMES_ALLOW_PUBLIC_UPSTREAM=1 to re-enable Nous
+# upstream remote add / sync even on enterprise endpoints.
+_ALLOW_PUBLIC_UPSTREAM_ENV = "HERMES_ALLOW_PUBLIC_UPSTREAM"
+_ENTERPRISE_ENDPOINT_ENV = "HERMES_ENTERPRISE_ENDPOINT"
+
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
+
+
+def _normalize_remote_url(url: str) -> str:
+    normalized = url.rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    return normalized
+
+
+def _enterprise_official_urls() -> set[str]:
+    """URLs from Hermes Root official-source.json, if present."""
+    try:
+        from hermes_cli.official_source import (
+            get_active_hermes_home,
+            official_urls_from_source,
+            read_official_source,
+        )
+
+        data = read_official_source(get_active_hermes_home())
+        if not data:
+            return set()
+        return {_normalize_remote_url(u) for u in official_urls_from_source(data)}
+    except Exception:
+        return set()
+
+
+def _origin_host(origin_url: Optional[str]) -> str:
+    if not origin_url:
+        return ""
+    value = origin_url.strip()
+    if value.startswith("git@"):
+        return value[len("git@") :].partition(":")[0].lower()
+    try:
+        from urllib.parse import urlparse
+
+        return (urlparse(value).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _should_disable_public_upstream(origin_url: Optional[str] = None) -> bool:
+    """Enterprise endpoints must not add/sync NousResearch as upstream."""
+    if os.environ.get(_ALLOW_PUBLIC_UPSTREAM_ENV, "").strip() in {"1", "true", "yes"}:
+        return False
+    if os.environ.get(_ENTERPRISE_ENDPOINT_ENV, "").strip() in {"1", "true", "yes"}:
+        return True
+    if _enterprise_official_urls():
+        return True
+    if _origin_host(origin_url) == "git.superic.com":
+        return True
+    return False
+
+
+def _effective_official_repo_urls() -> set[str]:
+    enterprise = _enterprise_official_urls()
+    if enterprise:
+        return enterprise
+    return {_normalize_remote_url(u) for u in OFFICIAL_REPO_URLS}
 
 def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
     """Get the URL of the origin remote, or None if not set."""
@@ -2866,20 +2941,19 @@ def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
     return None
 
 def _is_fork(origin_url: Optional[str]) -> bool:
-    """Check if the origin remote points to a fork (not the official repo)."""
+    """Check if the origin remote points to a fork (not the official repo).
+
+    When enterprise ``official-source.json`` is present, those URLs are
+    treated as official — origin matching them is NOT a fork.
+    """
     if not origin_url:
         return False
-    # Normalize URL for comparison (strip trailing .git if present)
-    normalized = origin_url.rstrip("/")
-    if normalized.endswith(".git"):
-        normalized = normalized[:-4]
-    for official in OFFICIAL_REPO_URLS:
-        official_normalized = official.rstrip("/")
-        if official_normalized.endswith(".git"):
-            official_normalized = official_normalized[:-4]
-        if normalized == official_normalized:
+    normalized = _normalize_remote_url(origin_url)
+    for official in _effective_official_repo_urls():
+        if normalized == official:
             return False
     return True
+
 
 def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     """Check if an 'upstream' remote already exists."""
@@ -2894,8 +2968,12 @@ def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     except Exception:
         return False
 
+
 def _add_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     """Add the official repo as the 'upstream' remote. Returns True on success."""
+    origin_url = _get_origin_url(git_cmd, cwd)
+    if _should_disable_public_upstream(origin_url):
+        return False
     try:
         result = subprocess.run(
             git_cmd + ["remote", "add", "upstream", OFFICIAL_REPO_URL],
@@ -2974,6 +3052,12 @@ def _sync_with_upstream_if_needed(
     avoid reporting the checkout as up to date on the strength of an origin
     comparison alone (#97052 review).
     """
+    origin_url = _get_origin_url(git_cmd, cwd)
+    if _should_disable_public_upstream(origin_url):
+        # Enterprise official identity / endpoint: never add NousResearch
+        # upstream. Origin IS the official enterprise repo.
+        return True
+
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
     if not has_upstream:

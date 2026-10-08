@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 import hashlib
+import json
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2089,3 +2090,240 @@ class TestHostedRoomRuns:
                 )
             assert rejected.status == 403
             create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Rich tool lifecycle on /v1/runs
+# ---------------------------------------------------------------------------
+
+
+def _rich_bridge(redact_text=None):
+    from agent.redact import redact_sensitive_text
+    from gateway.platforms.api_server_runs import RunToolEventBridge
+
+    events = []
+    if redact_text is None:
+        def redact_text(text: str) -> str:
+            return redact_sensitive_text(
+                text, force=True, redact_url_credentials=True
+            )
+    bridge = RunToolEventBridge(
+        run_id="run_rich",
+        push=events.append,
+        redact_text=redact_text,
+    )
+    return bridge, events
+
+
+class TestRichToolEventBridge:
+    def test_start_and_complete_share_stable_call_id(self):
+        bridge, events = _rich_bridge()
+        bridge.on_start("call_xxx", "read_file", {"path": "README.md"})
+        bridge.on_complete("call_xxx", "read_file", {"path": "README.md"}, "file body")
+
+        started, completed = events
+        assert started["event"] == "tool.started"
+        assert started["tool"] == "read_file"
+        assert started["tool_call_id"] == "call_xxx"
+        assert started["arguments"] == {"path": "README.md"}
+        assert started["preview"]
+        assert started["redacted"] is False
+        assert started["truncated"] is False
+        assert completed["event"] == "tool.completed"
+        assert completed["tool_call_id"] == started["tool_call_id"]
+        assert completed["tool"] == "read_file"
+        assert completed["result"] == "file body"
+        assert completed["error"] is False
+        assert completed["duration"] >= 0
+        assert completed["preview"] == "file body"
+        assert {"tool", "preview", "duration", "error"} <= completed.keys()
+
+    def test_parallel_same_name_calls_stay_correlated(self):
+        bridge, events = _rich_bridge()
+        bridge.on_start("C1", "read_file", {"path": "a.txt"})
+        bridge.on_start("C2", "read_file", {"path": "b.txt"})
+        bridge.on_complete("C2", "read_file", {"path": "b.txt"}, "body-b")
+        bridge.on_complete("C1", "read_file", {"path": "a.txt"}, "body-a")
+
+        by_id = {}
+        for event in events:
+            by_id.setdefault(event["tool_call_id"], {})[event["event"]] = event
+        assert set(by_id) == {"C1", "C2"}
+        assert by_id["C1"]["tool.completed"]["result"] == "body-a"
+        assert by_id["C2"]["tool.completed"]["result"] == "body-b"
+        assert by_id["C1"]["tool.started"]["arguments"]["path"] == "a.txt"
+        assert by_id["C2"]["tool.started"]["arguments"]["path"] == "b.txt"
+
+    def test_duplicate_callbacks_emit_one_lifecycle_pair(self):
+        bridge, events = _rich_bridge()
+        bridge.on_start("C1", "read_file", {"path": "a.txt"})
+        bridge.on_start("C1", "read_file", {"path": "other.txt"})
+        bridge.on_complete("C1", "read_file", {"path": "a.txt"}, "first")
+        bridge.on_complete("C1", "read_file", {"path": "a.txt"}, "second")
+        bridge.on_progress(
+            "tool.started", "read_file", "DUP", {"path": "a.txt"}
+        )
+        bridge.on_progress(
+            "tool.completed", "read_file", None, None, duration=1, is_error=True
+        )
+
+        assert [event["event"] for event in events] == [
+            "tool.started",
+            "tool.completed",
+        ]
+        assert events[0]["arguments"]["path"] == "a.txt"
+        assert events[1]["result"] == "first"
+
+    def test_empty_call_id_and_orphan_complete_are_not_fabricated(self):
+        bridge, events = _rich_bridge()
+        bridge.on_start("", "read_file", {"path": "a.txt"})
+        bridge.on_start(None, "read_file", {"path": "a.txt"})
+        bridge.on_complete("missing", "read_file", {"path": "a.txt"}, "body")
+        assert events == []
+
+    def test_non_object_arguments_are_omitted(self):
+        bridge, events = _rich_bridge()
+        bridge.on_start("C1", "read_file", "raw-args-should-not-leak")
+        assert "arguments" not in events[0]
+        assert events[0]["redacted"] is True
+        assert "raw-args-should-not-leak" not in json.dumps(events[0])
+        assert events[0]["tool_call_id"] == "C1"
+
+    def test_failed_tool_sets_error(self):
+        bridge, events = _rich_bridge()
+        bridge.on_start("C1", "read_file", {"path": "missing.txt"})
+        bridge.on_complete(
+            "C1",
+            "read_file",
+            {"path": "missing.txt"},
+            {"success": False, "error": "missing file"},
+        )
+        assert events[1]["error"] is True
+        assert events[1]["result"]["error"] == "missing file"
+
+    def test_secret_canary_is_removed_before_egress(self):
+        canary = "sk-m02-DO-NOT-LEAK-0123456789abcdef"
+        bridge, events = _rich_bridge()
+        bridge.on_start(
+            "C1",
+            "read_file",
+            {
+                "path": "fixtures/m02-safe.txt",
+                "api_key": canary,
+                "note": f"prefix {canary} suffix",
+                "nested": {"password": "plain-secret-value"},
+            },
+        )
+        bridge.on_complete(
+            "C1",
+            "read_file",
+            {"path": "fixtures/m02-safe.txt"},
+            {"body": f"result {canary}", "cookie": "session=secret"},
+        )
+        payload = json.dumps(events)
+        assert canary not in payload
+        assert "plain-secret-value" not in payload
+        assert events[0]["redacted"] is True
+        assert events[0]["arguments"]["path"] == "fixtures/m02-safe.txt"
+        assert events[0]["arguments"]["api_key"] == "«redacted»"
+        assert events[0]["arguments"]["nested"]["password"] == "«redacted»"
+        assert events[1]["redacted"] is True
+        assert events[1]["result"]["cookie"] == "«redacted»"
+
+    def test_oversized_result_is_truncated_to_64kib(self):
+        from gateway.platforms.api_server_runs import _MAX_RICH_TOOL_EVENT_BYTES
+
+        bridge, events = _rich_bridge()
+        bridge.on_start("C1", "read_file", {"path": "big.txt"})
+        bridge.on_complete("C1", "read_file", {"path": "big.txt"}, "A" * (80 * 1024))
+        completed = events[1]
+        assert completed["truncated"] is True
+        assert len(json.dumps(completed).encode("utf-8")) <= _MAX_RICH_TOOL_EVENT_BYTES
+        assert completed["result"].startswith("A")
+        assert len(completed["result"]) < 80 * 1024
+
+    def test_nested_depth_past_eight_is_truncated(self):
+        canary = "sk-m02-DO-NOT-LEAK-0123456789abcdef"
+        node = {"api_key": canary}
+        for _ in range(8):
+            node = {"child": node}
+        bridge, events = _rich_bridge()
+        bridge.on_start("C1", "read_file", node)
+        assert events[0]["truncated"] is True
+        assert canary not in json.dumps(events[0])
+
+    def test_sanitizer_failure_omits_rich_field_and_still_emits(self):
+        def _boom(_text: str) -> str:
+            raise RuntimeError("sanitizer down")
+
+        bridge, events = _rich_bridge(redact_text=_boom)
+        bridge.on_start("C1", "read_file", {"path": "README.md"})
+        bridge.on_complete("C1", "read_file", {"path": "README.md"}, "file body")
+        assert [event["event"] for event in events] == [
+            "tool.started",
+            "tool.completed",
+        ]
+        assert "arguments" not in events[0]
+        assert events[0]["redacted"] is True
+        assert events[0]["tool_call_id"] == "C1"
+        assert "result" not in events[1]
+        assert events[1]["redacted"] is True
+        assert "file body" not in json.dumps(events[1])
+
+
+class TestRunRichToolWiring:
+    @pytest.mark.asyncio
+    async def test_runs_bind_stable_callbacks_once(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _run(user_message=None, conversation_history=None, task_id=None):
+                    kwargs = mock_create.call_args.kwargs
+                    kwargs["tool_start_callback"](
+                        "call_read", "read_file", {"path": "README.md"}
+                    )
+                    kwargs["tool_progress_callback"](
+                        "tool.started", "read_file", "DUP", {"path": "README.md"}
+                    )
+                    kwargs["tool_complete_callback"](
+                        "call_read",
+                        "read_file",
+                        {"path": "README.md"},
+                        "file body",
+                    )
+                    kwargs["tool_progress_callback"](
+                        "tool.completed",
+                        "read_file",
+                        None,
+                        None,
+                        duration=9,
+                        is_error=False,
+                        result="should-not-appear-as-second-terminal",
+                    )
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(40):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+                assert status["status"] == "completed"
+                body = await (await cli.get(f"/v1/runs/{run_id}/events")).text()
+
+        assert body.count('"event": "tool.started"') == 1
+        assert body.count('"event": "tool.completed"') == 1
+        assert "call_read" in body
+        assert "README.md" in body
+        assert "file body" in body
+        assert "should-not-appear-as-second-terminal" not in body

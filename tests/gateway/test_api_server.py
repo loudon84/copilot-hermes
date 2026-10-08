@@ -654,6 +654,36 @@ class TestRunEventCallback:
         for field in ("preview", "goal", "summary", "output_tail"):
             assert secret not in event[field], field
 
+    @pytest.mark.asyncio
+    async def test_progress_callback_does_not_emit_tool_lifecycle(self, adapter):
+        """Rich runs own tool.started/completed via stable callbacks.
+
+        The progress callback must not add a second lifecycle pair.
+        """
+        run_id = "run_no_progress_lifecycle"
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+        adapter._run_statuses.pop(run_id, None)
+
+        callback = adapter._make_run_event_callback(run_id, loop)
+        callback("tool.started", "read_file", "README.md", {"path": "README.md"})
+        callback(
+            "tool.completed",
+            "read_file",
+            None,
+            None,
+            duration=0.2,
+            is_error=False,
+            result="file body",
+        )
+        callback("reasoning.available", "_thinking", "safe summary", None)
+
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event["event"] == "reasoning.available"
+        assert event["text"] == "safe summary"
+        assert queue.empty()
+
 
 # ---------------------------------------------------------------------------
 # /health endpoint
@@ -873,6 +903,8 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["tool_progress_events"] is True
+            assert data["features"]["run_tool_event_details_v1"] is True
             assert data["features"]["runs_idempotency"] == {
                 "supported": True,
                 "durable": True,

@@ -4,11 +4,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
+import threading
 import time
 import uuid
 from contextlib import suppress
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 try:
     from aiohttp import web
@@ -153,15 +155,462 @@ def _set_run_status(
     return current
 
 
-def _make_run_event_callback(
+# Public rich-tool event ceiling. Depth counts the arguments/result value
+# itself as level 1; a child past this depth is dropped.
+_MAX_RICH_TOOL_EVENT_BYTES = 64 * 1024
+_MAX_RICH_TOOL_DEPTH = 8
+_RICH_PREVIEW_CHARS = 240
+_REDACTED_SECRET = "«redacted»"
+_TOOL_LIFECYCLE_PROGRESS = frozenset({"tool.started", "tool.completed"})
+_EXTRA_SECRET_KEYS = frozenset({"cookie", "set_cookie"})
+
+
+def _event_json_size(event: Dict[str, Any]) -> int:
+    """Byte size of the JSON object the runs SSE writer puts in ``data:``."""
+    return len(json.dumps(event).encode("utf-8"))
+
+
+def _is_secret_key(key: str) -> bool:
+    from agent.redact import _SENSITIVE_BODY_KEYS
+
+    folded = str(key).strip().lower().replace("-", "_")
+    if folded in _SENSITIVE_BODY_KEYS or folded in _EXTRA_SECRET_KEYS:
+        return True
+    compact = folded.replace("_", "")
+    return compact in {item.replace("_", "") for item in _SENSITIVE_BODY_KEYS}
+
+
+def _sanitize_rich_value(
+    value: Any,
+    *,
+    depth: int,
+    redact_text: Callable[[str], str],
+) -> tuple[Any, bool, bool]:
+    """Return ``(safe_value, redacted, truncated)`` for one public field.
+
+    Unsupported values (bytes, custom objects) are omitted by the caller
+    when this raises ``TypeError``. Secret-bearing keys are replaced, never
+    copied through. Nesting past ``_MAX_RICH_TOOL_DEPTH`` becomes null.
+    """
+    if depth > _MAX_RICH_TOOL_DEPTH:
+        return None, False, True
+    if value is None or isinstance(value, bool):
+        return value, False, False
+    if isinstance(value, int):
+        return value, False, False
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None, False, True
+        return value, False, False
+    if isinstance(value, str):
+        safe = redact_text(value)
+        return safe, safe != value, False
+    if isinstance(value, bytes):
+        raise TypeError("raw bytes are not a public rich-tool value")
+    if isinstance(value, tuple):
+        value = list(value)
+    if isinstance(value, list):
+        safe_items: List[Any] = []
+        redacted = False
+        truncated = False
+        for item in value:
+            child, child_redacted, child_truncated = _sanitize_rich_value(
+                item, depth=depth + 1, redact_text=redact_text
+            )
+            safe_items.append(child)
+            redacted = redacted or child_redacted
+            truncated = truncated or child_truncated
+        return safe_items, redacted, truncated
+    if isinstance(value, dict):
+        safe_obj: Dict[str, Any] = {}
+        redacted = False
+        truncated = False
+        for key, child in value.items():
+            key_text = str(key)
+            if _is_secret_key(key_text):
+                safe_obj[key_text] = _REDACTED_SECRET
+                redacted = True
+                continue
+            safe_key = redact_text(key_text)
+            if safe_key != key_text:
+                redacted = True
+            child_safe, child_redacted, child_truncated = _sanitize_rich_value(
+                child, depth=depth + 1, redact_text=redact_text
+            )
+            safe_obj[safe_key] = child_safe
+            redacted = redacted or child_redacted
+            truncated = truncated or child_truncated
+        return safe_obj, redacted, truncated
+    raise TypeError(f"unsupported rich-tool value type: {type(value).__name__}")
+
+
+def _string_paths(value: Any, prefix: tuple[Any, ...] = ()):
+    if isinstance(value, str):
+        yield prefix
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield from _string_paths(child, prefix + (key,))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _string_paths(child, prefix + (index,))
+
+
+def _lookup(root: Any, path: tuple[Any, ...]) -> Any:
+    current = root
+    for part in path:
+        current = current[part]
+    return current
+
+
+def _assign(root: Any, path: tuple[Any, ...], new_value: Any) -> None:
+    current = root
+    for part in path[:-1]:
+        current = current[part]
+    current[path[-1]] = new_value
+
+
+def _shrink_tail(text: str) -> str:
+    if not text:
+        return text
+    cut = max(1, len(text) // 8)
+    return text[:-cut]
+
+
+def _bound_rich_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop the tail of public strings until the JSON payload fits."""
+    truncated = bool(event.get("truncated"))
+    guard = 0
+    while _event_json_size(event) > _MAX_RICH_TOOL_EVENT_BYTES and guard < 10000:
+        guard += 1
+        shrunk = False
+        for field in ("result", "arguments", "preview"):
+            if field not in event:
+                continue
+            paths = list(_string_paths(event[field]))
+            for path in reversed(paths):
+                current = _lookup(event[field], path) if path else event[field]
+                if not isinstance(current, str) or not current:
+                    continue
+                updated = _shrink_tail(current)
+                if path:
+                    _assign(event[field], path, updated)
+                else:
+                    event[field] = updated
+                shrunk = True
+                truncated = True
+                break
+            if shrunk:
+                break
+        if shrunk:
+            continue
+        if "result" in event:
+            event.pop("result")
+            truncated = True
+            continue
+        if "arguments" in event:
+            event.pop("arguments")
+            truncated = True
+            continue
+        break
+    event["truncated"] = truncated
+    return event
+
+
+class RunToolEventBridge:
+    """Per-run projection of stable tool callbacks onto ``/v1/runs`` events.
+
+    ``on_start`` / ``on_complete`` are the only tool lifecycle source.
+    ``on_progress`` keeps reasoning and subagent boundaries and ignores
+    ``tool.started`` / ``tool.completed`` so those progress callbacks cannot
+    emit a second pair.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        push: Callable[[Dict[str, Any]], None],
+        redact_text: Callable[[str], str],
+    ) -> None:
+        self._run_id = run_id
+        self._push = push
+        self._redact_text = redact_text
+        self._lock = threading.Lock()
+        self._started_at: Dict[str, float] = {}
+        self._finished: set[str] = set()
+
+    def on_progress(
+        self,
+        event_type: str,
+        tool_name: str = None,
+        preview: str = None,
+        args=None,
+        **kwargs,
+    ) -> None:
+        if event_type in _TOOL_LIFECYCLE_PROGRESS:
+            return
+        ts = time.time()
+        if event_type == "reasoning.available":
+            text = preview or ""
+            try:
+                text = self._redact_text(str(text))
+            except Exception:
+                self._fidelity("sanitize_reasoning")
+                text = ""
+            self._push({
+                "event": "reasoning.available",
+                "run_id": self._run_id,
+                "timestamp": ts,
+                "text": text,
+            })
+            return
+        if event_type not in {"subagent.start", "subagent.complete"}:
+            # _thinking, subagent.tool, and subagent_progress are
+            # high-volume UI noise and stay off this stream.
+            return
+        event: Dict[str, Any] = {
+            "event": event_type,
+            "run_id": self._run_id,
+            "timestamp": ts,
+        }
+        if preview is not None:
+            try:
+                event["preview"] = self._redact_text(str(preview))
+            except Exception:
+                self._fidelity("sanitize_subagent")
+                event["preview"] = ""
+        for key in (
+            "goal",
+            "task_count",
+            "task_index",
+            "subagent_id",
+            "child_session_id",
+            "parent_id",
+            "depth",
+            "model",
+            "tool_count",
+            "status",
+            "summary",
+            "duration_seconds",
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "api_calls",
+            "cost_usd",
+            "files_read",
+            "files_written",
+            "output_tail",
+        ):
+            value = kwargs.get(key)
+            if value is None:
+                continue
+            # Free-text fields can carry child terminal/tool output —
+            # force the same secret redaction the API applies to error
+            # text before it leaves the process on a public stream.
+            if key in ("goal", "summary", "output_tail") and isinstance(value, str):
+                try:
+                    value = self._redact_text(value)
+                except Exception:
+                    self._fidelity("sanitize_subagent")
+                    value = ""
+            event[key] = value
+        self._push(event)
+
+    def on_start(self, call_id: Any, tool_name: Any, args: Any) -> None:
+        try:
+            self._emit_start(call_id, tool_name, args)
+        except Exception:
+            self._fidelity("start_projection")
+
+    def on_complete(
+        self,
+        call_id: Any,
+        tool_name: Any,
+        args: Any,
+        result: Any,
+    ) -> None:
+        try:
+            self._emit_complete(call_id, tool_name, args, result)
+        except Exception:
+            self._fidelity("complete_projection")
+
+    def _emit_start(self, call_id: Any, tool_name: Any, args: Any) -> None:
+        stable_id = self._stable_id(call_id, kind="empty_call_id")
+        tool = self._tool_name(tool_name)
+        if stable_id is None or tool is None:
+            return
+        with self._lock:
+            if stable_id in self._started_at:
+                self._fidelity("duplicate_start")
+                return
+            self._started_at[stable_id] = time.monotonic()
+        arguments, redacted, truncated = self._public_arguments(args)
+        preview, preview_redacted = self._start_preview(tool, arguments)
+        event: Dict[str, Any] = {
+            "event": "tool.started",
+            "run_id": self._run_id,
+            "timestamp": time.time(),
+            "tool": tool,
+            "tool_call_id": stable_id,
+            "preview": preview,
+            "redacted": redacted or preview_redacted,
+            "truncated": truncated,
+        }
+        if arguments is not None:
+            event["arguments"] = arguments
+        self._push(_bound_rich_event(event))
+
+    def _emit_complete(
+        self,
+        call_id: Any,
+        tool_name: Any,
+        args: Any,
+        result: Any,
+    ) -> None:
+        stable_id = self._stable_id(call_id, kind="empty_call_id")
+        tool = self._tool_name(tool_name)
+        if stable_id is None or tool is None:
+            return
+        with self._lock:
+            if stable_id not in self._started_at:
+                self._fidelity("complete_without_start")
+                return
+            if stable_id in self._finished:
+                self._fidelity("duplicate_complete")
+                return
+            started = self._started_at[stable_id]
+            self._finished.add(stable_id)
+        duration = round(max(0.0, time.monotonic() - started), 3)
+        public_result, redacted, truncated, include_result = self._public_result(result)
+        preview, preview_redacted = self._complete_preview(public_result if include_result else None)
+        event: Dict[str, Any] = {
+            "event": "tool.completed",
+            "run_id": self._run_id,
+            "timestamp": time.time(),
+            "tool": tool,
+            "tool_call_id": stable_id,
+            "duration": duration,
+            "error": self._result_is_error(tool, result),
+            "preview": preview,
+            "redacted": redacted or preview_redacted,
+            "truncated": truncated,
+        }
+        if include_result:
+            event["result"] = public_result
+        self._push(_bound_rich_event(event))
+
+    def _stable_id(self, call_id: Any, *, kind: str) -> Optional[str]:
+        if not isinstance(call_id, str) or not call_id.strip():
+            self._fidelity(kind)
+            return None
+        return call_id
+
+    def _tool_name(self, tool_name: Any) -> Optional[str]:
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            self._fidelity("empty_tool_name")
+            return None
+        return tool_name
+
+    def _public_arguments(self, args: Any) -> tuple[Optional[dict], bool, bool]:
+        if args is None:
+            return None, False, False
+        if not isinstance(args, dict):
+            self._fidelity("arguments_not_object")
+            return None, True, False
+        try:
+            safe, redacted, truncated = _sanitize_rich_value(
+                args, depth=1, redact_text=self._redact_text
+            )
+        except Exception:
+            self._fidelity("sanitize_arguments")
+            return None, True, False
+        if not isinstance(safe, dict):
+            self._fidelity("sanitize_arguments")
+            return None, True, truncated
+        return safe, redacted, truncated
+
+    def _public_result(self, result: Any) -> tuple[Any, bool, bool, bool]:
+        if isinstance(result, (bytes, bytearray)):
+            self._fidelity("sanitize_result")
+            return None, True, False, False
+        try:
+            safe, redacted, truncated = _sanitize_rich_value(
+                result, depth=1, redact_text=self._redact_text
+            )
+        except Exception:
+            self._fidelity("sanitize_result")
+            return None, True, False, False
+        return safe, redacted, truncated, True
+
+    def _start_preview(self, tool: str, arguments: Optional[dict]) -> tuple[str, bool]:
+        preview = tool
+        if isinstance(arguments, dict) and arguments:
+            try:
+                from agent.display import build_tool_preview
+
+                built = build_tool_preview(tool, arguments, max_len=_RICH_PREVIEW_CHARS)
+                if built:
+                    preview = built
+            except Exception:
+                self._fidelity("preview")
+                preview = tool
+        return self._redact_preview(preview)
+
+    def _complete_preview(self, result: Any) -> tuple[str, bool]:
+        if result is None:
+            return "", False
+        if isinstance(result, str):
+            text = result
+        else:
+            try:
+                text = json.dumps(result, ensure_ascii=False, default=str)
+            except Exception:
+                self._fidelity("preview")
+                return "", True
+        if len(text) > _RICH_PREVIEW_CHARS:
+            text = text[:_RICH_PREVIEW_CHARS]
+        return self._redact_preview(text)
+
+    def _redact_preview(self, preview: str) -> tuple[str, bool]:
+        try:
+            safe = self._redact_text(preview)
+        except Exception:
+            self._fidelity("preview")
+            return "", True
+        return safe, safe != preview
+
+    def _result_is_error(self, tool: str, result: Any) -> bool:
+        try:
+            from agent.display import _detect_tool_failure
+
+            payload = result
+            if not isinstance(result, (str, type(None))):
+                payload = json.dumps(result, default=str)
+            is_error, _suffix = _detect_tool_failure(tool, payload)
+            return bool(is_error)
+        except Exception:
+            self._fidelity("error_classification")
+            return False
+
+    def _fidelity(self, kind: str) -> None:
+        logger.warning("[api_server] rich tool fidelity violation kind=%s", kind)
+
+
+def _make_run_tool_event_bridge(
     self,
     run_id: str,
     loop: "asyncio.AbstractEventLoop",
     *,
     _api_server,
-):
-    """Return a callback that pushes structured events to the run SSE queue."""
+) -> RunToolEventBridge:
+    """Build the per-run bridge that owns ``/v1/runs`` tool events."""
     redact_sensitive_text = _api_server.redact_sensitive_text
+
+    def _redact(text: str) -> str:
+        return redact_sensitive_text(
+            text, force=True, redact_url_credentials=True
+        )
 
     def _push(event: Dict[str, Any]) -> None:
         self._set_run_status(
@@ -177,88 +626,20 @@ def _make_run_event_callback(
         except Exception:
             pass
 
-    def _callback(
-        event_type: str,
-        tool_name: str = None,
-        preview: str = None,
-        args=None,
-        **kwargs,
-    ):
-        ts = time.time()
-        if event_type == "tool.started":
-            _push({
-                "event": "tool.started",
-                "run_id": run_id,
-                "timestamp": ts,
-                "tool": tool_name,
-                "preview": preview,
-            })
-        elif event_type == "tool.completed":
-            _push({
-                "event": "tool.completed",
-                "run_id": run_id,
-                "timestamp": ts,
-                "tool": tool_name,
-                "duration": round(kwargs.get("duration", 0), 3),
-                "error": kwargs.get("is_error", False),
-            })
-        elif event_type == "reasoning.available":
-            _push({
-                "event": "reasoning.available",
-                "run_id": run_id,
-                "timestamp": ts,
-                "text": preview or "",
-            })
-        elif event_type in {"subagent.start", "subagent.complete"}:
-            event = {
-                "event": event_type,
-                "run_id": run_id,
-                "timestamp": ts,
-            }
-            if preview is not None:
-                event["preview"] = redact_sensitive_text(
-                    str(preview), force=True
-                )
-            for key in (
-                "goal",
-                "task_count",
-                "task_index",
-                "subagent_id",
-                "child_session_id",
-                "parent_id",
-                "depth",
-                "model",
-                "tool_count",
-                "status",
-                "summary",
-                "duration_seconds",
-                "input_tokens",
-                "output_tokens",
-                "reasoning_tokens",
-                "api_calls",
-                "cost_usd",
-                "files_read",
-                "files_written",
-                "output_tail",
-            ):
-                value = kwargs.get(key)
-                if value is None:
-                    continue
-                # Free-text fields can carry child terminal/tool output —
-                # force the same secret redaction the API applies to error
-                # text before it leaves the process on a public stream.
-                if key in ("goal", "summary", "output_tail") and isinstance(
-                    value, str
-                ):
-                    value = redact_sensitive_text(value, force=True)
-                event[key] = value
-            _push(event)
-        # _thinking, subagent.tool, and subagent_progress are intentionally
-        # not forwarded on the /v1/runs stream: they are high-volume UI
-        # noise. Lifecycle boundaries (start/complete) still need to land
-        # so clients can observe delegate_task timeouts and failures.
+    return RunToolEventBridge(run_id=run_id, push=_push, redact_text=_redact)
 
-    return _callback
+
+def _make_run_event_callback(
+    self,
+    run_id: str,
+    loop: "asyncio.AbstractEventLoop",
+    *,
+    _api_server,
+):
+    """Return the non-lifecycle progress callback for a run SSE queue."""
+    return _make_run_tool_event_bridge(
+        self, run_id, loop, _api_server=_api_server
+    ).on_progress
 
 
 def _run_idempotency_scope(
@@ -619,7 +1000,9 @@ async def _handle_runs(
     self._run_streams_created[run_id] = created_at
     self._run_approval_sessions[run_id] = approval_session_key
 
-    event_cb = self._make_run_event_callback(run_id, loop)
+    event_bridge = _make_run_tool_event_bridge(
+        self, run_id, loop, _api_server=_api_server
+    )
 
     def _put_event_if_active(event: Optional[Dict]) -> None:
         """Enqueue only while this run still owns live transport state."""
@@ -721,7 +1104,9 @@ async def _handle_runs(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
-                    tool_progress_callback=event_cb,
+                    tool_progress_callback=event_bridge.on_progress,
+                    tool_start_callback=event_bridge.on_start,
+                    tool_complete_callback=event_bridge.on_complete,
                     gateway_session_key=gateway_session_key,
                     requested_model=agent_overrides.get("requested_model"),
                     requested_provider=agent_overrides.get("requested_provider"),
